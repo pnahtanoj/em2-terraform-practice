@@ -15,6 +15,12 @@ variable "network_address_space" {
 variable "subnet1_address_space" {
   default = "10.1.0.0/24"
 }
+variable "subnet2_address_space" {
+  default = "10.1.1.0/24"
+}
+variable "application" {}
+variable "billing_code_tag" {}
+variable "environment_tag" {}
 
 
 ##################################################################################
@@ -25,6 +31,19 @@ provider "aws" {
   access_key = var.aws_access_key
   secret_key = var.aws_secret_key
   region     = var.region
+}
+
+##################################################################################
+# LOCALS
+##################################################################################
+
+locals {
+  common_tags = {
+    BillingCode = var.billing_code_tag
+    Environment = var.environment_tag
+  }
+
+  tag_name_prefix = "${var.application}-${var.environment_tag}"
 }
 
 ##################################################################################
@@ -59,45 +78,87 @@ data "aws_ami" "aws-linux" {
 ##################################################################################
 
 # NETWORKING #
-resource "aws_vpc" "em2_staging_vpc" {
+resource "aws_vpc" "vpc" {
   cidr_block           = var.network_address_space
   enable_dns_hostnames = "true"
 
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-vpc" })
 }
 
-resource "aws_internet_gateway" "em2_staging_igw" {
-  vpc_id = aws_vpc.em2_staging_vpc.id
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.vpc.id
 
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-igw" })
 }
 
-resource "aws_subnet" "em2_staging_subnet1" {
+resource "aws_subnet" "subnet1" {
   cidr_block              = var.subnet1_address_space
-  vpc_id                  = aws_vpc.em2_staging_vpc.id
+  vpc_id                  = aws_vpc.vpc.id
   map_public_ip_on_launch = "true"
   availability_zone       = data.aws_availability_zones.available.names[0]
 
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-subnet1" })
+}
+
+resource "aws_subnet" "subnet2" {
+  cidr_block              = var.subnet2_address_space
+  vpc_id                  = aws_vpc.vpc.id
+  map_public_ip_on_launch = "true"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-subnet2" })
 }
 
 # ROUTING #
-resource "aws_route_table" "em2_staging_rtb" {
-  vpc_id = aws_vpc.em2_staging_vpc.id
+resource "aws_route_table" "rtb" {
+  vpc_id = aws_vpc.vpc.id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.em2_staging_igw.id
+    gateway_id = aws_internet_gateway.igw.id
   }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-rtb" })
 }
 
-resource "aws_route_table_association" "em2_staging_rta-subnet1" {
-  subnet_id      = aws_subnet.em2_staging_subnet1.id
-  route_table_id = aws_route_table.em2_staging_rtb.id
+resource "aws_route_table_association" "rta-subnet1" {
+  subnet_id      = aws_subnet.subnet1.id
+  route_table_id = aws_route_table.rtb.id
+}
+
+resource "aws_route_table_association" "rta-subnet2" {
+  subnet_id      = aws_subnet.subnet2.id
+  route_table_id = aws_route_table.rtb.id
 }
 
 # SECURITY GROUPS #
-resource "aws_security_group" "em2_staging_sg" {
+resource "aws_security_group" "elb-sg" {
+  name   = "nginx_elb_sg"
+  vpc_id = aws_vpc.vpc.id
+
+  #Allow HTTP from anywhere
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  #allow all outbound
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-elb" })
+}
+
+resource "aws_security_group" "instance_sg" {
   name        = "em2-staging"
   description = "SG for EM2 Staging"
-  vpc_id      = aws_vpc.em2_staging_vpc.id
+  vpc_id      = aws_vpc.vpc.id
 
   ingress {
     from_port   = 22
@@ -109,7 +170,7 @@ resource "aws_security_group" "em2_staging_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.network_address_space]
   }
   egress {
     from_port   = 0
@@ -117,18 +178,35 @@ resource "aws_security_group" "em2_staging_sg" {
     protocol    = -1
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-instance-sg" })
+}
+
+# LOAD BALANCER #
+resource "aws_elb" "web" {
+  name = "em2-staging-elb"
+
+  subnets         = [aws_subnet.subnet1.id, aws_subnet.subnet2.id]
+  security_groups = [aws_security_group.elb-sg.id]
+  instances       = [aws_instance.instance1.id, aws_instance.instance2.id]
+
+  listener {
+    instance_port     = 80
+    instance_protocol = "http"
+    lb_port           = 80
+    lb_protocol       = "http"
+  }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-elb" })
 }
 
 # INSTANCES #
-resource "aws_instance" "em2_staging_instance" {
+resource "aws_instance" "instance1" {
   ami                    = data.aws_ami.aws-linux.id
-  tags                   = {
-    name  = "EM2 Staging Instance"
-  }
   instance_type          = "t2.micro"
-  subnet_id              = aws_subnet.em2_staging_subnet1.id
+  subnet_id              = aws_subnet.subnet1.id
   key_name               = var.key_name
-  vpc_security_group_ids = [aws_security_group.em2_staging_sg.id]
+  vpc_security_group_ids = [aws_security_group.instance_sg.id]
 
   connection {
     type        = "ssh"
@@ -141,15 +219,44 @@ resource "aws_instance" "em2_staging_instance" {
   provisioner "remote-exec" {
     inline = [
       "sudo yum install nginx -y",
-      "sudo service nginx start"
+      "sudo service nginx start",
+      "echo '<html><head><title>Blue Team Server</title></head><body style=\"background-color:#1F778D\"><p style=\"text-align: center;\"><span style=\"color:#FFFFFF;\"><span style=\"font-size:28px;\">Blue Team</span></span></p></body></html>' | sudo tee /usr/share/nginx/html/index.html"
     ]
   }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-instance1" })
+}
+
+resource "aws_instance" "instance2" {
+  ami                    = data.aws_ami.aws-linux.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.subnet2.id
+  vpc_security_group_ids = [aws_security_group.instance_sg.id]
+  key_name               = var.key_name
+
+  connection {
+    type        = "ssh"
+    host        = self.public_ip
+    user        = "ec2-user"
+    private_key = file(var.private_key_path)
+
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo yum install nginx -y",
+      "sudo service nginx start",
+      "echo '<html><head><title>Green Team Server</title></head><body style=\"background-color:#77A032\"><p style=\"text-align: center;\"><span style=\"color:#FFFFFF;\"><span style=\"font-size:28px;\">Green Team</span></span></p></body></html>' | sudo tee /usr/share/nginx/html/index.html"
+    ]
+  }
+
+  tags = merge(local.common_tags, { Name = "${local.tag_name_prefix}-instance2" })
 }
 
 ##################################################################################
 # OUTPUT
 ##################################################################################
 
-output "aws_instance_public_dns" {
-  value = aws_instance.em2_staging_instance.public_dns
+output "aws_elb_public_dns" {
+  value = aws_elb.web.dns_name
 }
